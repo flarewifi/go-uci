@@ -193,6 +193,34 @@ func TestDelSection(t *testing.T) {
 	assert.False(exists)
 }
 
+// TestDelSection_anonymous regression-tests deleting an anonymous section by
+// its GetSections-returned synthetic "@type[index]" selector.
+// config.Del previously matched only by a section's literal Name field,
+// which is empty for an anonymous section — so DelSection("@system[0]")
+// silently matched nothing and removed nothing, while the caller (and a
+// following Commit()) saw no error at all.
+func TestDelSection_anonymous(t *testing.T) {
+	assert := assert.New(t)
+	r := NewTree("testdata")
+
+	// testdata/system's own `config system` stanza has no explicit name, so
+	// GetSections hands back its positional selector.
+	names, exists := r.GetSections("system", "system")
+	assert.True(exists)
+	assert.ElementsMatch(names, []string{"@system[0]"})
+
+	r.DelSection("system", "@system[0]")
+
+	names, exists = r.GetSections("system", "system")
+	assert.True(exists)
+	assert.Len(names, 0)
+
+	// A sibling named section in the same file is untouched.
+	names, exists = r.GetSections("system", "timeserver")
+	assert.True(exists)
+	assert.ElementsMatch(names, []string{"ntp"})
+}
+
 func TestGet(t *testing.T) {
 	assert := assert.New(t)
 
