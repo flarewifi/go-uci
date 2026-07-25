@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -383,6 +384,93 @@ func TestRevert(t *testing.T) {
 	assert.True(tree.configs["system"].tainted)
 	r.Revert("system")
 	assert.Len(tree.configs, 0)
+}
+
+// TestAddSection_afterRevertAll regression-tests adding a section to a config
+// that does not exist on disk after a no-argument Revert().
+//
+// Revert() with no arguments used to set tree.configs to nil outright, rather
+// than to an empty map. AddSection's "config is not on disk, synthesize it"
+// branch then assigned straight into that nil map, panicking with
+// "assignment to entry in nil map" — even though loadConfig had always
+// guarded the very same assignment with a nil check.
+func TestAddSection_afterRevertAll(t *testing.T) {
+	assert := assert.New(t)
+	r := NewTree("testdata")
+
+	// Stage some state, then discard all of it. This is the documented way
+	// to drop every staged change without touching the file system.
+	assert.NoError(r.LoadConfig("system", false))
+	r.Revert()
+
+	// A config that genuinely does not exist under testdata/, so AddSection
+	// has to synthesize it rather than load it.
+	assert.NotPanics(func() {
+		assert.NoError(r.AddSection("nonexistent", "a", "section"))
+	})
+
+	// The synthesized config is fully usable afterwards.
+	assert.True(r.Set("nonexistent", "a", "option", "42"))
+	values, exists := r.Get("nonexistent", "a", "option")
+	assert.True(exists)
+	assert.ElementsMatch(values, []string{"42"})
+
+	// Reverting everything a second time leaves the tree in the same
+	// reusable state, rather than a one-shot nil.
+	r.Revert()
+	assert.NotPanics(func() {
+		assert.NoError(r.AddSection("nonexistent", "b", "section"))
+	})
+}
+
+// TestGetSections_concurrent regression-tests GetSections against concurrent
+// writers.
+//
+// GetSections was the only method touching tree.configs without holding the
+// tree's mutex, yet it reaches loadConfig (via ensureConfigLoaded), which
+// *writes* tree.configs — loadConfig's own doc comment requires the caller to
+// hold the lock. Racing it against any writer is an unsynchronised map
+// read/write, which the Go runtime turns into a fatal "concurrent map read and
+// map write" rather than merely a wrong result. The tree is process-wide and
+// shared, so this is the normal access pattern, not a corner case.
+//
+// Run under -race to observe the failure on unfixed code.
+func TestGetSections_concurrent(t *testing.T) {
+	const goroutines = 4
+	const iterations = 50
+
+	r := NewTree("testdata")
+	var wg sync.WaitGroup
+
+	start := make(chan struct{})
+	spawn := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				fn()
+			}
+		}()
+	}
+
+	for i := 0; i < goroutines; i++ {
+		// Readers. "system" always exists under testdata/, so this must
+		// always report the config as present.
+		spawn(func() {
+			if _, exists := r.GetSections("system", "system"); !exists {
+				t.Error("GetSections: expected config system to exist")
+			}
+		})
+
+		// Writers: each of these mutates tree.configs or a config within it.
+		spawn(func() { _ = r.LoadConfig("system", true) })
+		spawn(func() { _ = r.AddSection("nonexistent", "a", "section") })
+		spawn(func() { r.Set("nonexistent", "a", "option", "42") })
+	}
+
+	close(start)
+	wg.Wait()
 }
 
 func TestCommit(t *testing.T) {

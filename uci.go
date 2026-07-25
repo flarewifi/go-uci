@@ -115,6 +115,19 @@ func (t *tree) LoadConfig(name string, forceReload bool) error {
 	return t.loadConfig(name)
 }
 
+// ensureConfigsMap initializes the configs map if it is nil, so that callers
+// can assign into it unconditionally. Its call must be guarded by locking the
+// tree's mutex.
+//
+// This lives as a method rather than being inlined at each call site because
+// several of those sites take a string parameter named "config", which shadows
+// the config type and makes make(map[string]*config) unspellable there.
+func (t *tree) ensureConfigsMap() {
+	if t.configs == nil {
+		t.configs = make(map[string]*config)
+	}
+}
+
 // loadConfig actually reads a config file. Its call must be guarded by
 // locking the tree's mutex.
 func (t *tree) loadConfig(name string) error {
@@ -127,9 +140,7 @@ func (t *tree) loadConfig(name string) error {
 		return err
 	}
 
-	if t.configs == nil {
-		t.configs = make(map[string]*config)
-	}
+	t.ensureConfigsMap()
 	t.configs[name] = cfg
 	return nil
 }
@@ -153,7 +164,10 @@ func (t *tree) Commit() error {
 func (t *tree) Revert(configs ...string) {
 	t.Lock()
 	if len(configs) == 0 {
-		t.configs = nil
+		// Assign an empty map rather than nil: a nil map is a valid state
+		// for reads and for delete(), but panics on assignment, which
+		// leaves every writer downstream having to guard against it.
+		t.configs = make(map[string]*config)
 	}
 	for _, config := range configs {
 		delete(t.configs, config)
@@ -162,6 +176,9 @@ func (t *tree) Revert(configs ...string) {
 }
 
 func (t *tree) GetSections(config string, secType string) ([]string, bool) {
+	t.Lock()
+	defer t.Unlock()
+
 	cfg, exists := t.ensureConfigLoaded(config)
 	if !exists {
 		return nil, false
@@ -308,6 +325,7 @@ func (t *tree) AddSection(config, section, typ string) error {
 	if !ok {
 		cfg = newConfig(config)
 		cfg.tainted = true
+		t.ensureConfigsMap()
 		t.configs[config] = cfg
 	}
 	sec := cfg.Get(section)
